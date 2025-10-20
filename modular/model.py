@@ -25,10 +25,15 @@ class TinyTransformerLM(nnx.Module):
         self.pos_linear = None  # not using learned positional embeddings; we use RoPE in attention
         layers = [TransformerBlock(dim, num_heads, mlp_ratio, dropout, rngs=rngs) for _ in range(num_layers)]
         self.layers = nnx.List(layers) if flax.__version__ >= '0.12.0' else layers # type: ignore
-        self.ln_f = nnx.LayerNorm(dim, rngs=rngs)
 
         # main LM head(s)
-        self.head = nnx.Linear(dim, vocab_size, rngs=rngs)  # optionally tie to embed
+        self.head = nnx.Sequential(
+            nnx.LayerNorm(dim, rngs=rngs),
+            nnx.Linear(
+                dim, vocab_size,
+                kernel_init=nnx.initializers.uniform(scale=1e-3), # Uniform [-scale, scale]
+                bias_init=nnx.initializers.zeros,
+                rngs=rngs))  # optionally tie to embed
 
     def __call__(self, tokens: jax.Array) -> Array:
         """
@@ -41,7 +46,6 @@ class TinyTransformerLM(nnx.Module):
         # pass through transformer blocks
         for layer in self.layers:
             x = layer(x)
-        x = self.ln_f(x)  # (B, T, dim)
         logits = self.head(x)  # (B, T, V)
         return logits
 
