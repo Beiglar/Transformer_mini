@@ -47,6 +47,7 @@ def train_step(model: nnx.Module, optimizer: nnx.Optimizer, batch: tuple[Array|n
     return loss
 
 def compute_val_loss(model: TinyTransformerLM, dataloader: MemmapDataLoader):
+    model.eval()
     @nnx.jit
     def compute_val_loss_(model: TinyTransformerLM, batch: tuple[Array, Array]):
         batch_inputs, batch_targets = batch
