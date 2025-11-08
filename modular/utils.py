@@ -92,13 +92,13 @@ def plot_lr_find(lrs: list, losses: list, save_path: str | None = None):
 
 @partial(nnx.jit, static_argnames=['max_new_tokens', 'top_p', 'temperature'])
 def jit_generate(
-    model: TinyTransformerLM, 
-    initial_ids: Array, 
-    max_new_tokens: int, 
-    top_p: float, 
-    temperature: float, 
-    rng: PRNGKey) -> Array:
-    """JIT-compiled generation function."""
+    model: TinyTransformerLM,
+    initial_ids: Array,
+    max_new_tokens: int,
+    top_p: float,
+    temperature: float,
+    rng: PRNGKey,) -> Array:
+    """JIT-compiled generation function with KV caching option."""
     return model.generate(initial_ids, max_new_tokens, top_p, temperature, rng)
 
 def sample_from_model(
@@ -108,12 +108,12 @@ def sample_from_model(
     rng: PRNGKey,
     max_new_tokens: int = 100,
     top_p: float = 0.8,
-    temperature: float = 1.0
+    temperature: float = 1.0,
 ) -> str:
     """
-    Generates text from a model given an initial prompt.
+    Generates text from a model given an initial prompt with optional KV caching.
     """
-    assert top_p > 0 or top_p < 1, "`top_p` should be in range (0, 1]"
+    assert 0 < top_p <= 1, "`top_p` should be in range (0, 1]"
     assert temperature != 0, "`temperature` of zero divides by zero, can't do that around here."
     initial_ids = jnp.array([char_tokenizer.Encode(initial_text)], dtype=jnp.int32)
     model.eval()

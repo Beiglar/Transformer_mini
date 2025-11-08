@@ -37,7 +37,7 @@ def train_step(model: nnx.Module, optimizer: nnx.Optimizer, batch: tuple[Array|n
     batch_inputs, batch_targets = batch
 
     def loss_fn(model):
-        logits = model(batch_inputs)
+        logits, _ = model(batch_inputs)
         loss = optax.softmax_cross_entropy_with_integer_labels(
             logits=logits, labels=batch_targets).mean()
         return loss
@@ -51,7 +51,7 @@ def compute_val_loss(model: TinyTransformerLM, dataloader: MemmapDataLoader):
     @nnx.jit
     def compute_val_loss_(model: TinyTransformerLM, batch: tuple[Array, Array]):
         batch_inputs, batch_targets = batch
-        logits = model(batch_inputs)
+        logits, _ = model(batch_inputs)
         return optax.softmax_cross_entropy_with_integer_labels(logits, batch_targets).mean()
     
     total_loss = 0

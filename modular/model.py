@@ -22,7 +22,6 @@ class TinyTransformerLM(nnx.Module):
         self.dim = dim
         self.context_size = context_size if context_size is not None else 1024  # default context size
         self.embed = nnx.Embed(vocab_size, dim, rngs=rngs)
-        self.pos_linear = None  # not using learned positional embeddings; we use RoPE in attention
         layers = [TransformerBlock(dim, num_heads, mlp_ratio, dropout, rngs=rngs) for _ in range(num_layers)]
         self.layers = nnx.List(layers) if flax.__version__ >= '0.12.0' else layers # type: ignore
 
@@ -31,23 +30,33 @@ class TinyTransformerLM(nnx.Module):
             nnx.LayerNorm(dim, rngs=rngs),
             nnx.Linear(
                 dim, vocab_size,
-                kernel_init=nnx.initializers.uniform(scale=1e-3), # Uniform [-scale, scale]
+                kernel_init=nnx.initializers.uniform(scale=1e-3),
                 bias_init=nnx.initializers.zeros,
-                rngs=rngs))  # optionally tie to embed
+                rngs=rngs))
 
-    def __call__(self, tokens: jax.Array) -> Array:
+    def __call__(self, tokens: jax.Array, caches: list[tuple[Array, Array]] | None = None):
         """
         tokens: (B, T) integer token IDs
-        returns dict with:
-          'logits': Array of (B, T, V) for predicting t+1..t+H (list len)
+        caches: List of (key_cache, value_cache) tuples for each layer
+        returns:
+          logits: Array of (B, T, V) for predicting next tokens
+          new_caches: Updated caches for each layer
         """
         B, T = tokens.shape
         x = self.embed(tokens)  # (B, T, dim)
+        
+        new_caches = []
+        current_caches = caches if caches is not None else [None] * len(self.layers)
+        
         # pass through transformer blocks
-        for layer in self.layers:
-            x = layer(x)
+        for i, layer in enumerate(self.layers):
+            cache = current_caches[i]
+            cache_k, cache_v = cache if cache is not None else (None, None)
+            x, new_k, new_v = layer(x=x, cache_k=cache_k, cache_v=cache_v)
+            new_caches.append((new_k, new_v))
+            
         logits = self.head(x)  # (B, T, V)
-        return logits
+        return logits, new_caches
 
     def generate(
             self, 
@@ -57,21 +66,31 @@ class TinyTransformerLM(nnx.Module):
             temperature: float, 
             rng: PRNGKey) -> jax.Array:
         """
-        initial_tokens: (B, T) integer token IDs
-        returns: (B, T + max_new_tokens) integer token IDs
+        Generate text with KV caching for efficient inference
         """
         self.eval()
         B, T = initial_tokens.shape
         assert T >= 1, "Need at least one initial token to start generation"
         tokens = initial_tokens
-
-        for _ in range(max_new_tokens):
-            # Only process the last N tokens to maintain efficiency
-            context = tokens[:, -self.context_size:] if hasattr(self, 'context_size') else tokens
-            logits = self(context)
-            next_token_logits = logits[:, -1, :]
+        
+        # Initialize caches for each layer
+        caches = None
+        
+        for step in range(max_new_tokens):
+            if step == 0:
+                # First step: process all context tokens
+                context = tokens[:, -self.context_size:] if self.context_size is not None else tokens
+                logits, caches = self(context)
+                next_token_logits = logits[:, -1, :]
+            else:
+                # Subsequent steps: only process the last token with caching
+                last_token = tokens[:, -1:]
+                logits, caches = self(last_token, caches=caches)
+                next_token_logits = logits[:, 0, :]  # Only one token position
+                
             rng, subkey = jax.random.split(rng)
-            next_token = top_p_sample(subkey, next_token_logits, top_p=top_p, temperature=temperature)  # (B,)
+            next_token = top_p_sample(subkey, next_token_logits, top_p=top_p, temperature=temperature)
             next_token = next_token[:, None]  # (B, 1)
-            tokens = jnp.concatenate([tokens, next_token], axis=1)  # (B, T+1)
+            tokens = jnp.concatenate([tokens, next_token], axis=1)
+            
         return tokens
