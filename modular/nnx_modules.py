@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 import jaxlib
-from typing import Tuple, TypeAlias, Union, Callable
+from typing import Optional, Tuple, TypeAlias, Union, Callable
 
 Array = jax.Array
 PRNGKey: TypeAlias = Union[jaxlib.xla_client.ArrayImpl, jax.random.PRNGKey] # type: ignore
@@ -92,12 +92,93 @@ class SiLU(nnx.Module): # For use within sequential blocks (Not in use)
         return nnx.silu(x)
 
 
+class DecayDropout(nnx.Module):
+    """
+    A Dropout layer where the rate decays from `start_rate` to `end_rate`
+    based on the number of forward passes (steps).
+    """
+    def __init__(
+        self,
+        start_rate: float = 0.9,
+        end_rate: float = 0.1,
+        decay_scale: int = 1000,
+        *,
+        rngs: Optional[Union[nnx.Rngs, nnx.RngStream]] = None,
+        rng_collection: str = 'dropout',
+        deterministic: bool = False
+    ):
+        self.start_rate = nnx.Variable(jnp.array(start_rate))
+        self.end_rate = nnx.Variable(jnp.array(end_rate))
+        self.decay_scale = nnx.Variable(jnp.array(decay_scale, dtype=jnp.int32))
+        self.rng_collection = rng_collection
+        self.deterministic = deterministic
+
+        # 1. State Management:
+        # We use nnx.Variable to store the step. This ensures it is treated
+        # as a JAX array, can be updated inside JIT, and is included in checkpoints.
+        self.step = nnx.Variable(jnp.array(0, dtype=jnp.int32))
+
+        # 2. RNG Handling:
+        # We setup an RngStream. This allows us to just call self.rngs()
+        # later without manual splitting.
+        if isinstance(rngs, nnx.Rngs):
+            self.rngs = rngs[self.rng_collection].fork()
+        elif isinstance(rngs, nnx.RngStream):
+            self.rngs = rngs.fork()
+        elif rngs is None:
+            # Handle case where no RNG is provided (e.g. for inference-only init)
+            self.rngs = nnx.RngStream(rng_collection, tag='decay_dropout').fork()
+        else:
+            raise TypeError(f"rngs must be nnx.Rngs or nnx.RngStream, got {type(rngs)}")
+
+    def __call__(self, x: jax.Array, *, deterministic: Optional[bool] = None) -> jax.Array:
+        # 3. Argument Precedence:
+        # Check call-time argument first, then fall back to class attribute
+        deterministic = nnx.module.first_from(
+            deterministic,
+            self.deterministic,
+            error_msg="No `deterministic` arg provided."
+        )
+
+        # If deterministic (Eval mode), return input as-is and DO NOT increment step
+        if deterministic:
+            return x
+
+        # 4. Logic & Update:
+        # Read the value from the variable
+        current_step = self.step.get_value()
+
+        # Calculate current rate
+        # Formula: rate = (start - end) / (step / scale + 1) + end
+        rate = (self.start_rate - self.end_rate) / \
+               (current_step / self.decay_scale + 1) + self.end_rate
+
+        # Update the step counter (In-place update logic handled by NNX)
+        self.step.value += 1
+
+        # 5. Apply Dropout:
+        # Use the RngStream to generate a new key
+        key = self.rngs()
+        keep_prob = 1.0 - rate
+
+        # 6. Safety Checks:
+        # Handle edge cases to prevent NaNs or unnecessary computation
+        safe_keep_prob = jnp.where(keep_prob > 0., keep_prob, 1.0)
+
+        # Standard dropout logic
+        mask = jax.random.bernoulli(key, p=keep_prob, shape=x.shape)
+        return jax.lax.select(mask, x / safe_keep_prob, jnp.zeros_like(x))
+
+
 class GLU(nnx.Module):
     """Gated Linear Unit (GLU) with sigmoid activation and dropout"""
-    def __init__(self, in_features: int, hidden_dim: int, out_features: int, dropout: float, *, rngs: nnx.Rngs):
+    def __init__(self, in_features: int, hidden_dim: int, out_features: int, dropout: float|dict, *, rngs: nnx.Rngs):
         self.fc_gate_value = nnx.Linear(in_features, 2 * hidden_dim, rngs=rngs)
         self.fc_out = nnx.Linear(hidden_dim, out_features, rngs=rngs)
-        self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
+        if isinstance(dropout, dict):
+            self.dropout = DecayDropout(**dropout, rngs=rngs)
+        else:
+            self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
 
     def __call__(self, x: Array) -> Array:
         gate_val_proj = self.fc_gate_value(x)
@@ -110,10 +191,13 @@ class GLU(nnx.Module):
 
 class SwiGLU(nnx.Module):
     """SwiGLU activation: x * SiLU(Wx + b) * (Vx + c)"""
-    def __init__(self, in_features: int, hidden_dim: int, out_features: int, dropout: float, *, rngs: nnx.Rngs):
+    def __init__(self, in_features: int, hidden_dim: int, out_features: int, dropout: float|dict, *, rngs: nnx.Rngs):
         self.wv_proj = nnx.Linear(in_features, 2 * hidden_dim, rngs=rngs)
         self.out_proj = nnx.Linear(hidden_dim, out_features, rngs=rngs)
-        self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
+        if isinstance(dropout, dict):
+            self.dropout = DecayDropout(**dropout, rngs=rngs)
+        else:
+            self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
 
     def __call__(self, x: Array) -> Array:
         wv = self.wv_proj(x)
@@ -127,10 +211,13 @@ class SwiGLU(nnx.Module):
 class GeneralGLU(nnx.Module):
     """General Gated Linear Unit (GLU) with chosen activation and dropout"""
     def __init__(self, in_features: int, hidden_dim: int, out_features: int, 
-                 dropout: float, gate_activation: Callable, *, rngs: nnx.Rngs):
+                 dropout: float|dict, gate_activation: Callable, *, rngs: nnx.Rngs):
         self.wv_proj = nnx.Linear(in_features, 2 * hidden_dim, rngs=rngs)
         self.out_proj = nnx.Linear(hidden_dim, out_features, rngs=rngs)
-        self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
+        if isinstance(dropout, dict):
+            self.dropout = DecayDropout(**dropout, rngs=rngs)
+        else:
+            self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
         self.gate_fn = gate_activation
 
     def __call__(self, x: Array) -> Array:
@@ -144,7 +231,7 @@ class GeneralGLU(nnx.Module):
 
 class TransformerBlock(nnx.Module):
     """Transformer Block with Multi-head Self Attention, RoPE, GLU MLP, LayerNorm, and Residual Connections"""
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float, *, rngs: nnx.Rngs):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float|dict, *, rngs: nnx.Rngs):
         self.norm1 = nnx.LayerNorm(dim, rngs=rngs)
         self.attn = Attention(dim, num_heads, qkv_bias=False, rngs=rngs)
         self.norm2 = nnx.LayerNorm(dim, rngs=rngs)
@@ -155,8 +242,6 @@ class TransformerBlock(nnx.Module):
         # Attention with potential caching
         attn_out, new_k, new_v = self.attn(self.norm1(x), cache_k=cache_k, cache_v=cache_v)
         x = x + attn_out
-        
         # Feed-forward network
         x = x + self.ffn(self.norm2(x))
-        
         return x, new_k, new_v

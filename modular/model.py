@@ -10,13 +10,19 @@ class TinyTransformerLM(nnx.Module):
             num_layers: int = 6,
             num_heads: int = 8,
             mlp_ratio: float = 4.0,
-            dropout: float = 0.5,
+            dropout: float|dict = 0.5,
             context_size: int | None = None,
             *, rngs: nnx.Rngs):
         if dim % num_heads != 0:
             raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
-        if dropout < 0 or dropout > 1:
+        if isinstance(dropout, float) and (dropout < 0 or dropout > 1):
             raise ValueError(f"dropout ({dropout}) must be between 0 and 1")
+        elif isinstance(dropout, dict):
+            if 'start_rate' in dropout and 'end_rate' in dropout:
+                if not (0 <= dropout['start_rate'] <= 1) or not (0 <= dropout['end_rate'] <= 1):
+                    raise ValueError("dropout rates must be between 0 and 1")
+            else:
+                raise ValueError("dropout dict must contain 'start_rate' and 'end_rate' keys")
 
         self.vocab_size = vocab_size
         self.dim = dim

@@ -1,5 +1,5 @@
+from typing import TypeAlias, Union
 import jax
-import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import nnx
@@ -8,7 +8,7 @@ from modular.model import TinyTransformerLM
 from modular.dataloader import MemmapDataLoader, jax_np_collet
 from modular.config import ModelConfig, LRConfig
 
-Array = jax.Array
+Array: TypeAlias = Union[jax.Array, np.ndarray]
 
 def create_model_and_optimizer(
         model_config: ModelConfig,
@@ -30,7 +30,7 @@ def create_model_and_optimizer(
     return model, optimizer, schedule
 
 @nnx.jit
-def train_step(model: nnx.Module, optimizer: nnx.Optimizer, batch: tuple[Array|np.ndarray, Array|np.ndarray]):
+def train_step(model: nnx.Module, optimizer: nnx.Optimizer, batch: tuple[Array, Array]):
     """
     Single training step: computes grads and updates the model and optimizer.
     """
@@ -43,7 +43,7 @@ def train_step(model: nnx.Module, optimizer: nnx.Optimizer, batch: tuple[Array|n
         return loss
 
     loss, grads = nnx.value_and_grad(loss_fn)(model)
-    optimizer.update(grads)
+    optimizer.update(model, grads)
     return loss
 
 def compute_val_loss(model: TinyTransformerLM, dataloader: MemmapDataLoader):
@@ -51,7 +51,7 @@ def compute_val_loss(model: TinyTransformerLM, dataloader: MemmapDataLoader):
     @nnx.jit
     def compute_val_loss_(model: TinyTransformerLM, batch: tuple[Array, Array]):
         batch_inputs, batch_targets = batch
-        logits, _ = model(batch_inputs)
+        logits, _ = model(batch_inputs) # type: ignore
         return optax.softmax_cross_entropy_with_integer_labels(logits, batch_targets).mean()
     
     total_loss = 0
